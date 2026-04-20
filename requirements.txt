@@ -1,5 +1,8 @@
 # Telegram bot library
 python-telegram-bot==20.3
 
-# aiohttp Python 3.14 compatible version
-aiohttp==3.8.7
+# aiohttp version fully compatible with Python 3.14 prebuilt wheel
+aiohttp==3.8.8
+
+# Optional: for SSL and modern TLS support (sometimes needed for bots)
+certifi==2023.12.7
