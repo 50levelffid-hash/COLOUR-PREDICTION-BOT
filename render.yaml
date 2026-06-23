@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: rtf-gaming-bot
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: CHANNELS
+        sync: false
+      - key: DEFAULT_UPI_ID
+        sync: false
+      - key: MONGO_URL
+        sync: false
+      - key: PORT
+        value: 3000
