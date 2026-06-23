@@ -15,10 +15,9 @@ const {
 // ── Config ──
 const TOKEN      = process.env.BOT_TOKEN;
 const ADMIN_ID   = Number(process.env.ADMIN_ID);
-const CHANNELS   = (process.env.CHANNELS || '').split(',').map(s => s.trim()).filter(Boolean);
 const PORT       = process.env.PORT || 3000;
 
-// ── Bot init (polling — works on Render free tier) ──
+// ── Bot init ──
 const bot = new TelegramBot(TOKEN, {
   polling: {
     interval: 300,
@@ -27,7 +26,7 @@ const bot = new TelegramBot(TOKEN, {
   }
 });
 
-// ── Keep-alive server for Render ──
+// ── Keep-alive server ──
 const app = express();
 app.get('/', (_, res) => res.send('RTF Gaming Bot is running ✅'));
 app.listen(PORT, () => console.log(`🌐 Keep-alive server on port ${PORT}`));
@@ -92,7 +91,7 @@ const WELCOME_TEXT = (name, uid, username) => `✨━━━━━━━━━━
 ⚠️ RULES
 ━━━━━━━━━━━━━━━━━━━━━━
 🎮 Min Bet: ₹1
-💸 Min Withdrawal: ₹30
+💸 Min Withdrawal: ₹50   // changed from ₹30
 🛡️ Play responsibly
 
 👑 OWNER: @RTFGAMMING
@@ -100,7 +99,7 @@ const WELCOME_TEXT = (name, uid, username) => `✨━━━━━━━━━━
 ✨ READY TO WIN BIG ✨`;
 
 // ══════════════════════════════════════════
-//   USER STATE MAP (per-user conversation state)
+//   USER STATE MAP
 // ══════════════════════════════════════════
 const userState = new Map(); // uid → { step, data }
 
@@ -111,12 +110,28 @@ function getUS(uid) {
 function clearUS(uid) { userState.set(uid, {}); }
 
 // ══════════════════════════════════════════
-//   FORCE JOIN CHECK
+//   FORCE JOIN CHECK (now from DB)
 // ══════════════════════════════════════════
 
+async function getForceChannels() {
+  // Try DB first, fallback to env
+  let channels = await getSetting('force_channels');
+  if (!channels || !Array.isArray(channels) || channels.length === 0) {
+    const envChannels = (process.env.CHANNELS || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (envChannels.length) {
+      // Save to DB for future
+      await setSetting('force_channels', envChannels);
+      return envChannels;
+    }
+    return [];
+  }
+  return channels;
+}
+
 async function checkChannels(userId) {
+  const channels = await getForceChannels();
   const missing = [];
-  for (const ch of CHANNELS) {
+  for (const ch of channels) {
     try {
       const member = await bot.getChatMember(ch, userId);
       if (!['member', 'administrator', 'creator'].includes(member.status)) missing.push(ch);
@@ -208,7 +223,7 @@ async function showBalance(chatId, uid) {
 }
 
 // ══════════════════════════════════════════
-//   PLAY — send bet panel without requiring /start again
+//   PLAY PANEL
 // ══════════════════════════════════════════
 
 async function showPlayPanel(chatId, uid) {
@@ -216,11 +231,9 @@ async function showPlayPanel(chatId, uid) {
   if (!u) return sendMsg(chatId, '❌ /start karo pehle');
   if (!state.gameActive) return sendMsg(chatId, '❌ Game abhi active nahi hai\n⏳ Admin ke game start karne ka wait karo');
 
-  // Re-opt-in
   state.optedOut.delete(uid);
   state.activePlayers.add(uid);
 
-  // Already bet this round?
   const existingBet = state.pendingBets.get(uid);
   if (existingBet) {
     const remaining = getRemainingSeconds();
@@ -244,7 +257,7 @@ async function showPlayPanel(chatId, uid) {
 }
 
 // ══════════════════════════════════════════
-//   DEPOSIT
+//   DEPOSIT / WITHDRAW
 // ══════════════════════════════════════════
 
 async function startDeposit(chatId, uid) {
@@ -252,27 +265,26 @@ async function startDeposit(chatId, uid) {
   await sendMsg(chatId, '💰 Kitna deposit karna hai? (min ₹10)');
 }
 
-// ══════════════════════════════════════════
-//   WITHDRAW
-// ══════════════════════════════════════════
-
 async function startWithdraw(chatId, uid) {
   getUS(uid).step = 'wd_amount';
-  await sendMsg(chatId, '💸 Withdrawal amount enter karo (min ₹30):');
+  await sendMsg(chatId, '💸 Withdrawal amount enter karo (min ₹50):'); // changed
 }
 
 // ══════════════════════════════════════════
-//   DAILY BONUS
+//   DAILY BONUS (now uses admin‑set amount)
 // ══════════════════════════════════════════
 
 async function dailyBonus(chatId, uid, from) {
   const u = await getUser(uid, from);
   const today = new Date().toISOString().split('T')[0];
   if (u.last_bonus === today) return sendMsg(chatId, '❌ Aaj ka bonus le chuke ho. Kal aana! 😊');
-  u.bonus += 3;
+
+  // Get daily bonus amount from DB setting (default ₹3)
+  const bonusAmount = Number(await getSetting('daily_bonus')) || 3;
+  u.bonus += bonusAmount;
   u.last_bonus = today;
   await u.save();
-  await sendMsg(chatId, '🎁 ₹3 daily bonus add ho gaya!');
+  await sendMsg(chatId, `🎁 ₹${bonusAmount} daily bonus add ho gaya!`);
 }
 
 // ══════════════════════════════════════════
@@ -370,7 +382,6 @@ bot.on('message', safe(async (msg) => {
     const total = await getBalance(u);
     if (total < amt) return sendMsg(chatId, `❌ Balance kam hai. Total: ₹${total}`);
 
-    // Deduct: deposit → bonus → winning
     let rem = amt;
     const stakeFrom = { deposit: 0, bonus: 0, winning: 0 };
     for (const key of ['deposit', 'bonus', 'winning']) {
@@ -387,7 +398,6 @@ bot.on('message', safe(async (msg) => {
     state.pendingBets.set(uid, { choice, amount: amt, stakeFrom });
     clearUS(uid);
 
-    // Update existing timer message to show bet placed (no bet buttons)
     const emoji = choice === 'big' ? '🔵' : '🔴';
     const totalReturn = Math.round(amt * WIN_MULT * 100) / 100;
     const netProfit   = Math.round((totalReturn - amt) * 100) / 100;
@@ -425,7 +435,7 @@ bot.on('message', safe(async (msg) => {
   // ── Withdraw amount ──
   if (us.step === 'wd_amount') {
     const amt = parseInt(txt);
-    if (isNaN(amt) || amt < 30) return sendMsg(chatId, '❌ Min ₹30 withdraw karo');
+    if (isNaN(amt) || amt < 50) return sendMsg(chatId, '❌ Min ₹50 withdraw karo'); // changed
     const u = await User.findOne({ uid });
     if (!u || u.winning < amt) return sendMsg(chatId, `❌ Winning balance kam hai: ₹${u?.winning || 0}`);
     us.wdAmount = amt;
@@ -443,7 +453,6 @@ bot.on('message', safe(async (msg) => {
     u.winning -= amt;
     await u.save();
 
-    // Save transaction
     const txn = await Transaction.create({ uid, type: 'withdrawal', amount: amt, upi_id: upiAddr, status: 'pending' });
 
     const forwardCh = await getSetting('forward_channel');
@@ -456,7 +465,6 @@ bot.on('message', safe(async (msg) => {
 
     await sendMsg(ADMIN_ID, wdText, { reply_markup: adminKb });
 
-    // Also forward to group/channel if set
     if (forwardCh) {
       await sendMsg(forwardCh, wdText + '\n\n⚠️ Approval sirf admin de sakta hai.');
     }
@@ -478,6 +486,27 @@ bot.on('message', safe(async (msg) => {
     clearUS(uid);
     return sendMsg(chatId, `✅ Forward channel set: ${txt}\nAb deposit/withdrawal requests wahan bhi jayenge.`);
   }
+
+  // ── Admin: set daily bonus ──
+  if (us.step === 'set_daily_bonus' && String(from.id) === String(ADMIN_ID)) {
+    const amt = parseFloat(txt);
+    if (isNaN(amt) || amt < 0) return sendMsg(chatId, '❌ Valid amount (e.g. 5) enter karo.');
+    await setSetting('daily_bonus', amt);
+    clearUS(uid);
+    return sendMsg(chatId, `✅ Daily bonus set to ₹${amt}`);
+  }
+
+  // ── Admin: add channel ──
+  if (us.step === 'add_channel' && String(from.id) === String(ADMIN_ID)) {
+    let ch = txt.trim();
+    if (!ch.startsWith('@') && !ch.startsWith('-')) ch = '@' + ch;
+    const current = (await getSetting('force_channels')) || [];
+    if (current.includes(ch)) return sendMsg(chatId, `❌ ${ch} already in list.`);
+    current.push(ch);
+    await setSetting('force_channels', current);
+    clearUS(uid);
+    return sendMsg(chatId, `✅ Channel ${ch} added to force‑join list.`);
+  }
 }));
 
 // ── Photo handler for deposit screenshot ──
@@ -486,7 +515,6 @@ bot.on('photo', safe(async (msg) => {
   const chatId = msg.chat.id;
   const us     = getUS(uid);
 
-  // Admin setting QR
   if (String(msg.from.id) === String(ADMIN_ID) && us.step === 'set_qr') {
     const fileId = msg.photo[msg.photo.length - 1].file_id;
     await setSetting('qr_file_id', fileId);
@@ -494,18 +522,15 @@ bot.on('photo', safe(async (msg) => {
     return sendMsg(chatId, '✅ QR Code saved!');
   }
 
-  // Deposit screenshot
   if (us.step === 'dep_screenshot') {
     const amt   = us.depAmount;
     const bonus = calcDepositBonus(amt);
     const u     = await User.findOne({ uid });
     if (!u || !amt) return sendMsg(chatId, '❌ Amount missing, deposit restart karo');
 
-    // Save transaction record
     const fileId = msg.photo[msg.photo.length - 1].file_id;
     const txn = await Transaction.create({ uid, type: 'deposit', amount: amt, screenshot_file_id: fileId, status: 'pending' });
 
-    // Forward screenshot to admin
     await bot.forwardMessage(ADMIN_ID, chatId, msg.message_id);
 
     const adminKb = { inline_keyboard: [[
@@ -517,7 +542,6 @@ bot.on('photo', safe(async (msg) => {
 
     await sendMsg(ADMIN_ID, depText, { reply_markup: adminKb });
 
-    // Forward to channel/group if set
     const forwardCh = await getSetting('forward_channel');
     if (forwardCh) {
       await bot.forwardMessage(forwardCh, chatId, msg.message_id);
@@ -582,7 +606,6 @@ bot.on('callback_query', safe(async (q) => {
     us.step = 'bet_amount';
     us.betChoice = choice;
 
-    // Don't remove buttons yet — keep timer running; ask for amount in new message
     const emoji = choice === 'big' ? '🔵' : '🔴';
     await sendMsg(chatId, `${emoji} ${choice.toUpperCase()} choose kiya!\n\n💰 Bet amount enter karo (min ₹1):`);
     return;
@@ -685,6 +708,55 @@ bot.on('callback_query', safe(async (q) => {
     return sendMsg(chatId, '📢 Forward channel/group ID ya @username bhejo:\n(e.g. @MyGroup ya -1001234567890)\n\nBot ko us channel/group ka admin banana padega!');
   }
 
+  // ── New: Set daily bonus ──
+  if (cb === 'set_daily_bonus') {
+    getUS(uid).step = 'set_daily_bonus';
+    return sendMsg(chatId, '💰 Daily bonus amount enter karo (e.g. 5):');
+  }
+
+  // ── New: Manage channels ──
+  if (cb === 'manage_channels') {
+    const channels = await getForceChannels();
+    let text = '📢 CURRENT FORCE‑JOIN CHANNELS:\n';
+    if (channels.length === 0) text += '(None)\n';
+    else channels.forEach((ch, i) => { text += `${i+1}. ${ch}\n`; });
+    text += '\nChoose action:';
+
+    const buttons = [];
+    if (channels.length > 0) {
+      // Add remove buttons for each channel
+      channels.forEach((ch, i) => {
+        buttons.push([{ text: `❌ Remove ${ch}`, callback_data: `remove_ch_${i}` }]);
+      });
+    }
+    buttons.push([{ text: '➕ Add Channel', callback_data: 'add_channel' }]);
+    buttons.push([{ text: '🔙 Back', callback_data: 'admin_back' }]);
+    return sendMsg(chatId, text, { reply_markup: { inline_keyboard: buttons } });
+  }
+
+  // ── Remove channel by index ──
+  if (cb.startsWith('remove_ch_')) {
+    const idx = parseInt(cb.split('_')[2]);
+    const channels = await getForceChannels();
+    if (idx < 0 || idx >= channels.length) return sendMsg(chatId, '❌ Invalid channel.');
+    const removed = channels.splice(idx, 1);
+    await setSetting('force_channels', channels);
+    return sendMsg(chatId, `✅ Removed ${removed[0]}`);
+  }
+
+  // ── Add channel ──
+  if (cb === 'add_channel') {
+    getUS(uid).step = 'add_channel';
+    return sendMsg(chatId, '📢 Channel @username or ID bhejo (e.g. @mychannel)');
+  }
+
+  // ── Admin back ──
+  if (cb === 'admin_back') {
+    // Re‑show admin panel
+    return showAdminPanel(chatId);
+  }
+
+  // ── Game control ──
   if (cb === 'admin_startgame') {
     if (state.gameActive) return sendMsg(chatId, '⚠️ Game already running');
     state.currentRound = 0;
@@ -707,7 +779,6 @@ bot.on('callback_query', safe(async (q) => {
   }
 
   if (cb === 'admin_backup') {
-    // Export all users as JSON summary
     const users = await User.find({}, '-__v').lean();
     const summary = JSON.stringify(users, null, 2);
     const buf = Buffer.from(summary);
@@ -716,27 +787,34 @@ bot.on('callback_query', safe(async (q) => {
   }
 }));
 
+// ── Helper to show admin panel ──
+async function showAdminPanel(chatId) {
+  const s = await Settings.find({}).lean();
+  const settingsMap = Object.fromEntries(s.map(x => [x.key, x.value]));
+  const gameStatus = state.gameActive ? '🟢 RUNNING' : '🔴 STOPPED';
+  const seqIdx = state.currentRound % RESULT_SEQUENCE.length;
+  const dailyBonus = settingsMap.daily_bonus || 3;
+  const channels = (await getForceChannels()).join(', ') || '(None)';
+
+  await sendMsg(chatId,
+    `⚙️ ADMIN PANEL\n━━━━━━━━━━━━━━━━\n👥 Users: ${await User.countDocuments()}\n🎮 Game: ${gameStatus}\n🎲 Active Bets: ${state.pendingBets.size}\n👁️ Active Players: ${state.activePlayers.size}\n🚫 Opted Out: ${state.optedOut.size}\n🔢 Round: #${state.currentRound + 1}\n🎯 Next Result: ${RESULT_SEQUENCE[seqIdx].toUpperCase()}\n━━━━━━━━━━━━━━━━\n📱 UPI: ${settingsMap.upi_id || process.env.DEFAULT_UPI_ID}\n🖼️ QR: ${settingsMap.qr_file_id ? '✅ Set' : '❌ Not Set'}\n📢 Forward Ch: ${settingsMap.forward_channel || '❌ Not Set'}\n💰 Daily Bonus: ₹${dailyBonus}\n📢 Force Channels: ${channels}\n━━━━━━━━━━━━━━━━`,
+    { reply_markup: { inline_keyboard: [
+      [{ text: '📱 Change UPI ID', callback_data: 'set_upi' }, { text: '🖼️ Set QR Code', callback_data: 'set_qr' }],
+      [{ text: '📢 Set Forward Channel', callback_data: 'set_fwd_ch' }],
+      [{ text: '💰 Set Daily Bonus', callback_data: 'set_daily_bonus' }, { text: '📢 Manage Channels', callback_data: 'manage_channels' }],
+      [{ text: '▶️ Start Game', callback_data: 'admin_startgame' }, { text: '⏹️ Stop Game', callback_data: 'admin_stopgame' }],
+      [{ text: '📊 Stats', callback_data: 'admin_stats' }, { text: '💾 Backup DB', callback_data: 'admin_backup' }]
+    ] } }
+  );
+}
+
 // ══════════════════════════════════════════
 //   ADMIN COMMANDS
 // ══════════════════════════════════════════
 
 bot.onText(/\/admin/, safe(async (msg) => {
   if (msg.from.id !== ADMIN_ID) return sendMsg(msg.chat.id, '❌ Admin nahi ho');
-
-  const s = await Settings.find({}).lean();
-  const settingsMap = Object.fromEntries(s.map(x => [x.key, x.value]));
-  const gameStatus = state.gameActive ? '🟢 RUNNING' : '🔴 STOPPED';
-  const seqIdx = state.currentRound % RESULT_SEQUENCE.length;
-
-  await sendMsg(msg.chat.id,
-    `⚙️ ADMIN PANEL\n━━━━━━━━━━━━━━━━\n👥 Users: ${await User.countDocuments()}\n🎮 Game: ${gameStatus}\n🎲 Active Bets: ${state.pendingBets.size}\n👁️ Active Players: ${state.activePlayers.size}\n🚫 Opted Out: ${state.optedOut.size}\n🔢 Round: #${state.currentRound + 1}\n🎯 Next Result: ${RESULT_SEQUENCE[seqIdx].toUpperCase()}\n━━━━━━━━━━━━━━━━\n📱 UPI: ${settingsMap.upi_id || process.env.DEFAULT_UPI_ID}\n🖼️ QR: ${settingsMap.qr_file_id ? '✅ Set' : '❌ Not Set'}\n📢 Forward Ch: ${settingsMap.forward_channel || '❌ Not Set'}\n━━━━━━━━━━━━━━━━`,
-    { reply_markup: { inline_keyboard: [
-      [{ text: '📱 Change UPI ID', callback_data: 'set_upi' }, { text: '🖼️ Set QR Code', callback_data: 'set_qr' }],
-      [{ text: '📢 Set Forward Channel', callback_data: 'set_fwd_ch' }],
-      [{ text: '▶️ Start Game', callback_data: 'admin_startgame' }, { text: '⏹️ Stop Game', callback_data: 'admin_stopgame' }],
-      [{ text: '📊 Stats', callback_data: 'admin_stats' }, { text: '💾 Backup DB', callback_data: 'admin_backup' }]
-    ] } }
-  );
+  await showAdminPanel(msg.chat.id);
 }));
 
 bot.onText(/\/startgame/, safe(async (msg) => {
@@ -760,7 +838,7 @@ bot.onText(/\/all (.+)/, safe(async (msg, match) => {
   for (const u of users) {
     const ok = await sendMsg(u.uid, text);
     ok ? sent++ : failed++;
-    await sleep(50); // rate limit safety
+    await sleep(50);
   }
   sendMsg(msg.chat.id, `📢 Done\n✅ Sent: ${sent}\n❌ Failed: ${failed}`);
 }));
@@ -819,7 +897,6 @@ async function runRound() {
   state.timerMsgIds.clear();
   state.pendingBets.clear();
 
-  // Send opening message to all active non-opted-out players
   const toNotify = [...state.activePlayers].filter(uid => !state.optedOut.has(uid));
   const bar = timerBar(ROUND_TIME);
 
@@ -836,9 +913,7 @@ async function runRound() {
     } catch { state.activePlayers.delete(uid); }
   }));
 
-  // Live countdown — update every 5s to stay within Telegram rate limits
-  // For 40-50 users: edit in batches with small delays
-  const UPDATE_INTERVAL = 5000; // every 5 seconds
+  const UPDATE_INTERVAL = 5000;
   let elapsed = 0;
 
   while (elapsed < ROUND_TIME * 1000) {
@@ -850,7 +925,6 @@ async function runRound() {
     const bar2 = timerBar(remaining);
     const allTimerUids = [...state.timerMsgIds.keys()];
 
-    // Batch edits with small delay to avoid Telegram flood limits
     for (let i = 0; i < allTimerUids.length; i++) {
       const uid2 = allTimerUids[i];
       if (state.optedOut.has(uid2)) continue;
@@ -873,9 +947,8 @@ async function runRound() {
             ]] } }
           );
         }
-      } catch { /* message too old or deleted */ }
+      } catch { /* ignore */ }
 
-      // Stagger edits: 50ms between each to avoid rate limits with 40-50 users
       if (i % 10 === 9) await sleep(50);
     }
   }
@@ -889,7 +962,6 @@ async function runRound() {
   const realBigTotal   = [...betsThisRound.values()].filter(b => b.choice === 'big').reduce((s, b) => s + b.amount, 0);
   const realSmallTotal = [...betsThisRound.values()].filter(b => b.choice === 'small').reduce((s, b) => s + b.amount, 0);
 
-  // Fake display stats
   const fakeBigPool   = Math.floor(Math.random() * 700 + 200);
   const fakeSmallPool = Math.floor(Math.random() * 700 + 200);
   const fakeTotalBets = Math.floor(Math.random() * 12 + 30);
@@ -929,7 +1001,6 @@ async function runRound() {
   }
   await Promise.all(betOps);
 
-  // Broadcast result to active players
   const resultText = `🎯 ROUND #${roundNum + 1} RESULT\n━━━━━━━━━━━━━━━━━━━━\n${resultEmoji} WINNER: ${result.toUpperCase()}\n━━━━━━━━━━━━━━━━━━━━\n🔵 Big Pool:   ₹${displayBig}\n🔴 Small Pool: ₹${displaySmall}\n🎮 Total Bets: ${displayTotal}\n🏆 Winners:    ${fakeWinners + realWinners}\n━━━━━━━━━━━━━━━━━━━━\n⏳ Next round ${BREAK_TIME}s me...`;
 
   await Promise.all(
@@ -940,16 +1011,14 @@ async function runRound() {
 
   state.currentRound++;
 
-  // Break between rounds
   await sleep(BREAK_TIME * 1000);
 
-  if (state.gameActive) runRound(); // tail-call next round
+  if (state.gameActive) runRound();
 }
 
 async function stopGame(chatId) {
   state.gameActive = false;
 
-  // Settle any remaining bets with next sequence result
   if (state.pendingBets.size > 0) {
     const result = RESULT_SEQUENCE[state.currentRound % RESULT_SEQUENCE.length];
     for (const [uid2, b] of state.pendingBets) {
