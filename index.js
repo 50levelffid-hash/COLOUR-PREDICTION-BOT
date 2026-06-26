@@ -91,7 +91,7 @@ const WELCOME_TEXT = (name, uid, username) => `✨━━━━━━━━━━
 ⚠️ RULES
 ━━━━━━━━━━━━━━━━━━━━━━
 🎮 Min Bet: ₹1
-💸 Min Withdrawal: ₹50   // changed from ₹30
+💸 Min Withdrawal: ₹50
 🛡️ Play responsibly
 
 👑 OWNER: @RTFGAMMING
@@ -110,16 +110,14 @@ function getUS(uid) {
 function clearUS(uid) { userState.set(uid, {}); }
 
 // ══════════════════════════════════════════
-//   FORCE JOIN CHECK (now from DB)
+//   FORCE JOIN CHECK
 // ══════════════════════════════════════════
 
 async function getForceChannels() {
-  // Try DB first, fallback to env
   let channels = await getSetting('force_channels');
   if (!channels || !Array.isArray(channels) || channels.length === 0) {
     const envChannels = (process.env.CHANNELS || '').split(',').map(s => s.trim()).filter(Boolean);
     if (envChannels.length) {
-      // Save to DB for future
       await setSetting('force_channels', envChannels);
       return envChannels;
     }
@@ -147,9 +145,22 @@ async function sendForceJoin(chatId, missing) {
   }]));
   buttons.push([{ text: '✅ I Joined', callback_data: 'check_join' }]);
   await sendMsg(chatId,
-    '╔═══〔 🔥 JOIN REQUIRED 〕═══╗\n🚀 Join all channels to use bot\n\n👉 Click below to join\n✅ Then press \'I Joined\'\n╚══════════════════════╝',
+    '╔═══〔 🔥 JOIN REQUIRED 〕═══╗\n🚀 Bot use karne ke liye sabhi channels join karo!\n\n👉 Neeche diye links se join karo\n✅ Join karne ke baad "I Joined" dabao\n╚══════════════════════╝',
     { reply_markup: { inline_keyboard: buttons } }
   );
+}
+
+// ── Global force-join middleware — user ke kisi bhi action pe check ──
+// Returns true if user is blocked (not joined), false if allowed
+async function requireJoin(chatId, userId) {
+  // Admin ko kabhi block mat karo
+  if (userId === ADMIN_ID) return false;
+  const missing = await checkChannels(userId);
+  if (missing.length) {
+    await sendForceJoin(chatId, missing);
+    return true; // blocked
+  }
+  return false; // allowed
 }
 
 // ══════════════════════════════════════════
@@ -189,11 +200,21 @@ async function sendContactRequest(chatId) {
 }
 
 // ══════════════════════════════════════════
-//   LEADERBOARD
+//   LEADERBOARD — total balance se sort (FIX)
 // ══════════════════════════════════════════
 
 async function showLeaderboard(chatId) {
-  const users = await User.find({}).sort({ winning: -1 }).limit(10);
+  // Total balance = deposit + bonus + winning — isi se sort karo
+  const users = await User.aggregate([
+    {
+      $addFields: {
+        totalBalance: { $add: ['$deposit', '$bonus', '$winning'] }
+      }
+    },
+    { $sort: { totalBalance: -1 } },
+    { $limit: 10 }
+  ]);
+
   if (!users.length) return sendMsg(chatId, '📊 Abhi koi data nahi hai!');
 
   let text = '🏆 TOP 10 LEADERBOARD\n━━━━━━━━━━━━━━━━━━━━\n';
@@ -202,7 +223,7 @@ async function showLeaderboard(chatId) {
   users.forEach((u, i) => {
     const total = (u.deposit || 0) + (u.bonus || 0) + (u.winning || 0);
     const name = u.name || 'Unknown';
-    text += `${medals[i]} ${name}\n    💰 Total Wallet: ₹${total} | 🏆 Winning: ₹${u.winning}\n`;
+    text += `${medals[i]} ${name}\n    💰 Total Balance: ₹${total} | 💸 Winning: ₹${u.winning || 0}\n`;
   });
   text += '━━━━━━━━━━━━━━━━━━━━';
   await sendMsg(chatId, text);
@@ -267,11 +288,11 @@ async function startDeposit(chatId, uid) {
 
 async function startWithdraw(chatId, uid) {
   getUS(uid).step = 'wd_amount';
-  await sendMsg(chatId, '💸 Withdrawal amount enter karo (min ₹50):'); // changed
+  await sendMsg(chatId, '💸 Withdrawal amount enter karo (min ₹50):');
 }
 
 // ══════════════════════════════════════════
-//   DAILY BONUS (now uses admin‑set amount)
+//   DAILY BONUS
 // ══════════════════════════════════════════
 
 async function dailyBonus(chatId, uid, from) {
@@ -279,7 +300,6 @@ async function dailyBonus(chatId, uid, from) {
   const today = new Date().toISOString().split('T')[0];
   if (u.last_bonus === today) return sendMsg(chatId, '❌ Aaj ka bonus le chuke ho. Kal aana! 😊');
 
-  // Get daily bonus amount from DB setting (default ₹3)
   const bonusAmount = Number(await getSetting('daily_bonus')) || 3;
   u.bonus += bonusAmount;
   u.last_bonus = today;
@@ -339,6 +359,14 @@ bot.on('message', safe(async (msg) => {
         refUser.referral += 1;
         refUser.referral_count += 1;
         await refUser.save();
+
+        // ── FIX: referred_by me naam ya username save karo ──
+        // Jo available ho — username prefer karo, warna naam
+        const referredByLabel = refUser.username
+          ? `@${refUser.username}`
+          : (refUser.name || refUser.uid);
+        await User.findOneAndUpdate({ uid }, { referred_by: referredByLabel });
+
         await sendMsg(us.pendingRef,
           `🎉 REFERRAL CONFIRMED!\n━━━━━━━━━━━━━━━━\n👤 ${u.name} ne join kiya!\n💰 +₹1 Referral Balance add ho gaya!\n━━━━━━━━━━━━━━━━\n👥 Total Referrals: ${refUser.referral_count}\n💵 Total Referral Balance: ₹${refUser.referral}`
         );
@@ -363,7 +391,13 @@ bot.on('message', safe(async (msg) => {
     }
   }
 
-  // ── Menu buttons ──
+  // ── Menu buttons — force join check on every button (non-admin) ──
+  const menuButtons = ['🎮 Play','💰 Balance','➕ Deposit','➖ Withdraw','👥 Refer','🎁 Daily Bonus','🏆 Leaderboard','🛑 Stop Game Notifications'];
+  if (menuButtons.includes(txt) && String(from.id) !== String(ADMIN_ID)) {
+    const blocked = await requireJoin(chatId, msg.from.id);
+    if (blocked) return;
+  }
+
   if (txt === '🎮 Play')                    return showPlayPanel(chatId, uid);
   if (txt === '💰 Balance')                 return showBalance(chatId, uid);
   if (txt === '➕ Deposit')                 return startDeposit(chatId, uid);
@@ -378,6 +412,12 @@ bot.on('message', safe(async (msg) => {
 
   // ── Bet amount entry ──
   if (us.step === 'bet_amount') {
+    // Force join check before bet
+    if (String(from.id) !== String(ADMIN_ID)) {
+      const blocked = await requireJoin(chatId, msg.from.id);
+      if (blocked) return clearUS(uid);
+    }
+
     const amt = parseInt(txt);
     if (isNaN(amt) || amt < 1) return sendMsg(chatId, '❌ Min bet ₹1 hai, valid number enter karo');
     if (!state.gameActive)     return (clearUS(uid), sendMsg(chatId, '❌ Game active nahi'));
@@ -403,7 +443,7 @@ bot.on('message', safe(async (msg) => {
     await u.save();
 
     const choice = us.betChoice;
-    state.pendingBets.set(uid, { choice, amount: amt, stakeFrom });
+    state.pendingBets.set(uid, { choice, amount: amt, stakeFrom, name: from.first_name, username: from.username || null });
     clearUS(uid);
 
     const emoji = choice === 'big' ? '🔵' : '🔴';
@@ -443,7 +483,7 @@ bot.on('message', safe(async (msg) => {
   // ── Withdraw amount ──
   if (us.step === 'wd_amount') {
     const amt = parseInt(txt);
-    if (isNaN(amt) || amt < 50) return sendMsg(chatId, '❌ Min ₹50 withdraw karo'); // changed
+    if (isNaN(amt) || amt < 50) return sendMsg(chatId, '❌ Min ₹50 withdraw karo');
     const u = await User.findOne({ uid });
     if (!u || u.winning < amt) return sendMsg(chatId, `❌ Winning balance kam hai: ₹${u?.winning || 0}`);
     us.wdAmount = amt;
@@ -680,6 +720,16 @@ bot.on('callback_query', safe(async (q) => {
     return;
   }
 
+  // ── Force join check on all non-admin callback actions (except check_join) ──
+  if (q.from.id !== ADMIN_ID) {
+    const missing = await checkChannels(q.from.id);
+    if (missing.length) {
+      await bot.answerCallbackQuery(q.id, { text: '❌ Pehle channels join karo!', show_alert: true });
+      await sendForceJoin(chatId, missing);
+      return;
+    }
+  }
+
   // ── Bet choice ──
   if (cb === 'bet_big' || cb === 'bet_small') {
     await bot.answerCallbackQuery(q.id);
@@ -719,7 +769,7 @@ bot.on('callback_query', safe(async (q) => {
     if (!u) return sendMsg(chatId, '❌ User not found');
     const total = await getBalance(u);
     return sendMsg(chatId,
-      `👤 USER PROFILE\n━━━━━━━━━━━━━━━━\n🆔 ID: ${tUid}\n👤 Name: ${u.name}\n🏷️ Username: @${u.username || 'N/A'}\n📱 Phone: ${u.phone || 'Not verified'}\n━━━━━━━━━━━━━━━━\n🏦 Deposit: ₹${u.deposit}\n🎁 Bonus:   ₹${u.bonus}\n💸 Winning: ₹${u.winning}\n👥 Referral: ₹${u.referral}\n💰 Total:   ₹${total}\n━━━━━━━━━━━━━━━━\n📅 Last Bonus: ${u.last_bonus || 'Never'}\n👥 Referrals: ${u.referral_count}`
+      `👤 USER PROFILE\n━━━━━━━━━━━━━━━━\n🆔 ID: ${tUid}\n👤 Name: ${u.name}\n🏷️ Username: @${u.username || 'N/A'}\n📱 Phone: ${u.phone || 'Not verified'}\n👥 Referred By: ${u.referred_by || 'Direct'}\n━━━━━━━━━━━━━━━━\n🏦 Deposit: ₹${u.deposit}\n🎁 Bonus:   ₹${u.bonus}\n💸 Winning: ₹${u.winning}\n👥 Referral: ₹${u.referral}\n💰 Total:   ₹${total}\n━━━━━━━━━━━━━━━━\n📅 Last Bonus: ${u.last_bonus || 'Never'}\n👥 Referrals Made: ${u.referral_count}`
     );
   }
 
@@ -796,13 +846,11 @@ bot.on('callback_query', safe(async (q) => {
     return sendMsg(chatId, '📢 Forward channel/group ID ya @username bhejo:\n(e.g. @MyGroup ya -1001234567890)\n\nBot ko us channel/group ka admin banana padega!');
   }
 
-  // ── New: Set daily bonus ──
   if (cb === 'set_daily_bonus') {
     getUS(uid).step = 'set_daily_bonus';
     return sendMsg(chatId, '💰 Daily bonus amount enter karo (e.g. 5):');
   }
 
-  // ── New: Manage channels ──
   if (cb === 'manage_channels') {
     const channels = await getForceChannels();
     let text = '📢 CURRENT FORCE‑JOIN CHANNELS:\n';
@@ -812,7 +860,6 @@ bot.on('callback_query', safe(async (q) => {
 
     const buttons = [];
     if (channels.length > 0) {
-      // Add remove buttons for each channel
       channels.forEach((ch, i) => {
         buttons.push([{ text: `❌ Remove ${ch}`, callback_data: `remove_ch_${i}` }]);
       });
@@ -822,7 +869,6 @@ bot.on('callback_query', safe(async (q) => {
     return sendMsg(chatId, text, { reply_markup: { inline_keyboard: buttons } });
   }
 
-  // ── Remove channel by index ──
   if (cb.startsWith('remove_ch_')) {
     const idx = parseInt(cb.split('_')[2]);
     const channels = await getForceChannels();
@@ -832,24 +878,20 @@ bot.on('callback_query', safe(async (q) => {
     return sendMsg(chatId, `✅ Removed ${removed[0]}`);
   }
 
-  // ── Add channel ──
   if (cb === 'add_channel') {
     getUS(uid).step = 'add_channel';
     return sendMsg(chatId, '📢 Channel @username or ID bhejo (e.g. @mychannel)');
   }
 
-  // ── Admin back ──
   if (cb === 'admin_back') {
     return showAdminPanel(chatId);
   }
 
-  // ── NEW: Direct Message to user ──
   if (cb === 'admin_dm') {
     getUS(uid).step = 'dm_uid';
     return sendMsg(chatId, '📩 Kis user ko message karna hai?\n\nUser ka UID ya @username bhejo:');
   }
 
-  // ── NEW: Force Result Mode toggle ──
   if (cb === 'toggle_force_result') {
     state.forceResultMode = !state.forceResultMode;
     const status = state.forceResultMode ? '🟢 ON' : '🔴 OFF';
@@ -860,19 +902,21 @@ bot.on('callback_query', safe(async (q) => {
     );
   }
 
-  // ── NEW: Balance Edit ──
   if (cb === 'admin_balance_edit') {
     getUS(uid).step = 'bal_uid';
     return sendMsg(chatId, '💰 Kiska balance edit karna hai?\n\nUser ka UID ya @username bhejo:');
   }
 
-  // ── NEW: Ban user ──
   if (cb === 'admin_ban_user') {
     getUS(uid).step = 'ban_uid';
     return sendMsg(chatId, '🚫 Kise ban karna hai?\n\nUser ka UID ya @username bhejo:');
   }
 
-  // ── Game control ──
+  // ── NEW: View current round bets ──
+  if (cb === 'admin_view_bets') {
+    return showCurrentRoundBets(chatId);
+  }
+
   if (cb === 'admin_startgame') {
     if (state.gameActive) return sendMsg(chatId, '⚠️ Game already running');
     state.currentRound = 0;
@@ -904,6 +948,54 @@ bot.on('callback_query', safe(async (q) => {
   }
 }));
 
+// ══════════════════════════════════════════
+//   ADMIN: VIEW CURRENT ROUND BETS
+// ══════════════════════════════════════════
+
+async function showCurrentRoundBets(chatId) {
+  if (!state.gameActive) return sendMsg(chatId, '❌ Game active nahi hai');
+  if (state.pendingBets.size === 0) {
+    return sendMsg(chatId, `🎮 ROUND #${state.currentRound + 1} — Abhi koi bet nahi aayi`);
+  }
+
+  let bigTotal = 0, smallTotal = 0;
+  let bigBets = [], smallBets = [];
+
+  for (const [betUid, b] of state.pendingBets) {
+    // naam/username dono try karo
+    const userInfo = await User.findOne({ uid: betUid }).catch(() => null);
+    const label = userInfo
+      ? (userInfo.username ? `@${userInfo.username}` : userInfo.name || betUid)
+      : betUid;
+
+    if (b.choice === 'big') {
+      bigTotal += b.amount;
+      bigBets.push(`  • ${label} — ₹${b.amount}`);
+    } else {
+      smallTotal += b.amount;
+      smallBets.push(`  • ${label} — ₹${b.amount}`);
+    }
+  }
+
+  const totalPool = bigTotal + smallTotal;
+  let text = `📊 ROUND #${state.currentRound + 1} — BETS DETAIL\n`;
+  text += `━━━━━━━━━━━━━━━━━━━━\n`;
+  text += `🔵 BIG — ₹${bigTotal} (${bigBets.length} bets)\n`;
+  bigBets.forEach(b => text += b + '\n');
+  text += `\n🔴 SMALL — ₹${smallTotal} (${smallBets.length} bets)\n`;
+  smallBets.forEach(b => text += b + '\n');
+  text += `\n💰 Total Pool: ₹${totalPool}\n`;
+  text += `━━━━━━━━━━━━━━━━━━━━`;
+
+  // Agar text bada ho to split karo
+  if (text.length > 4000) {
+    await sendMsg(chatId, text.slice(0, 4000));
+    await sendMsg(chatId, text.slice(4000));
+  } else {
+    await sendMsg(chatId, text);
+  }
+}
+
 // ── Helper to show admin panel ──
 async function showAdminPanel(chatId) {
   const s = await Settings.find({}).lean();
@@ -913,9 +1005,10 @@ async function showAdminPanel(chatId) {
   const dailyBonus = settingsMap.daily_bonus || 3;
   const channels = (await getForceChannels()).join(', ') || '(None)';
   const forceMode = state.forceResultMode ? '🟢 ON (Kam bet jeetegi)' : '🔴 OFF (Normal)';
+  const remaining = state.gameActive ? getRemainingSeconds() : 0;
 
   await sendMsg(chatId,
-    `⚙️ ADMIN PANEL\n━━━━━━━━━━━━━━━━\n👥 Users: ${await User.countDocuments()}\n🎮 Game: ${gameStatus}\n🎲 Active Bets: ${state.pendingBets.size}\n👁️ Active Players: ${state.activePlayers.size}\n🚫 Opted Out: ${state.optedOut.size}\n🔢 Round: #${state.currentRound + 1}\n🎯 Next Result: ${RESULT_SEQUENCE[seqIdx].toUpperCase()}\n🃏 Force Result: ${forceMode}\n━━━━━━━━━━━━━━━━\n📱 UPI: ${settingsMap.upi_id || process.env.DEFAULT_UPI_ID}\n🖼️ QR: ${settingsMap.qr_file_id ? '✅ Set' : '❌ Not Set'}\n📢 Forward Ch: ${settingsMap.forward_channel || '❌ Not Set'}\n💰 Daily Bonus: ₹${dailyBonus}\n📢 Force Channels: ${channels}\n━━━━━━━━━━━━━━━━`,
+    `⚙️ ADMIN PANEL\n━━━━━━━━━━━━━━━━\n👥 Users: ${await User.countDocuments()}\n🎮 Game: ${gameStatus}\n🎲 Active Bets This Round: ${state.pendingBets.size}\n⏳ Time Remaining: ${state.gameActive ? remaining + 's' : 'N/A'}\n👁️ Active Players: ${state.activePlayers.size}\n🚫 Opted Out: ${state.optedOut.size}\n🔢 Round: #${state.currentRound + 1}\n🎯 Next Result: ${RESULT_SEQUENCE[seqIdx].toUpperCase()}\n🃏 Force Result: ${forceMode}\n━━━━━━━━━━━━━━━━\n📱 UPI: ${settingsMap.upi_id || process.env.DEFAULT_UPI_ID}\n🖼️ QR: ${settingsMap.qr_file_id ? '✅ Set' : '❌ Not Set'}\n📢 Forward Ch: ${settingsMap.forward_channel || '❌ Not Set'}\n💰 Daily Bonus: ₹${dailyBonus}\n📢 Force Channels: ${channels}\n━━━━━━━━━━━━━━━━`,
     { reply_markup: { inline_keyboard: [
       [{ text: '📱 Change UPI ID', callback_data: 'set_upi' }, { text: '🖼️ Set QR Code', callback_data: 'set_qr' }],
       [{ text: '📢 Set Forward Channel', callback_data: 'set_fwd_ch' }],
@@ -924,7 +1017,8 @@ async function showAdminPanel(chatId) {
       [{ text: '📊 Stats', callback_data: 'admin_stats' }, { text: '💾 Backup DB', callback_data: 'admin_backup' }],
       [{ text: '📩 DM User', callback_data: 'admin_dm' }, { text: '💰 Edit Balance', callback_data: 'admin_balance_edit' }],
       [{ text: state.forceResultMode ? '🟢 Force Result: ON' : '🔴 Force Result: OFF', callback_data: 'toggle_force_result' }],
-      [{ text: '🚫 Ban User', callback_data: 'admin_ban_user' }]
+      [{ text: '🚫 Ban User', callback_data: 'admin_ban_user' }],
+      [{ text: '🎲 View Current Round Bets', callback_data: 'admin_view_bets' }]
     ] } }
   );
 }
@@ -951,7 +1045,11 @@ bot.onText(/\/stopgame/, safe(async (msg) => {
   await stopGame(msg.chat.id);
 }));
 
-// ── NEW: /ban <uid> ──
+bot.onText(/\/bets/, safe(async (msg) => {
+  if (msg.from.id !== ADMIN_ID) return sendMsg(msg.chat.id, '❌ Admin nahi ho');
+  await showCurrentRoundBets(msg.chat.id);
+}));
+
 bot.onText(/\/ban (.+)/, safe(async (msg, match) => {
   if (msg.from.id !== ADMIN_ID) return sendMsg(msg.chat.id, '❌ Admin nahi ho');
   let tUid = match[1].trim();
@@ -968,7 +1066,6 @@ bot.onText(/\/ban (.+)/, safe(async (msg, match) => {
   sendMsg(msg.chat.id, `✅ User ${u.name} (${tUid}) ban ho gaya!`);
 }));
 
-// ── NEW: /unban <uid> ──
 bot.onText(/\/unban (.+)/, safe(async (msg, match) => {
   if (msg.from.id !== ADMIN_ID) return sendMsg(msg.chat.id, '❌ Admin nahi ho');
   let tUid = match[1].trim();
@@ -1032,7 +1129,8 @@ bot.onText(/\/daily/, safe(async (msg) => {
 }));
 
 // ══════════════════════════════════════════
-//   GAME LOOP
+//   GAME LOOP — RESULT TIMING FIX
+//   60s betting window → result 5-10s baad
 // ══════════════════════════════════════════
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -1068,6 +1166,7 @@ async function runRound() {
     } catch { state.activePlayers.delete(uid); }
   }));
 
+  // ── Timer update loop — har 5s pe update ──
   const UPDATE_INTERVAL = 5000;
   let elapsed = 0;
 
@@ -1110,6 +1209,25 @@ async function runRound() {
 
   if (!state.gameActive) return;
 
+  // ── FIX: Time khatam hote hi IMMEDIATELY 7s ka countdown dikhao ──
+  // Users ko pata chale ki result aane wala hai
+  const countdownSecs = 7;
+  await Promise.all(
+    [...state.timerMsgIds.keys()]
+      .filter(uid2 => !state.optedOut.has(uid2))
+      .map(uid2 => {
+        const mid = state.timerMsgIds.get(uid2);
+        return editMsg(uid2, mid,
+          `🎮 ROUND #${roundNum + 1}\n⏳ Betting band!\n⚡ Result ${countdownSecs}s me aayega...`
+        ).catch(() => {});
+      })
+  );
+
+  // 7 seconds wait — then result
+  await sleep(countdownSecs * 1000);
+
+  if (!state.gameActive) return;
+
   // ── Settle bets ──
   const betsThisRound = new Map(state.pendingBets);
   state.pendingBets.clear();
@@ -1117,19 +1235,16 @@ async function runRound() {
   const realBigTotal   = [...betsThisRound.values()].filter(b => b.choice === 'big').reduce((s, b) => s + b.amount, 0);
   const realSmallTotal = [...betsThisRound.values()].filter(b => b.choice === 'small').reduce((s, b) => s + b.amount, 0);
 
-  // ── Force Result Mode: kam bet wali side jeetegi ──
-  let finalResult = result; // default: sequence se
+  let finalResult = result;
   if (state.forceResultMode && betsThisRound.size > 0) {
-    // Agar dono side pe bets hain to kam wali side jeetegi
-    // Agar sirf ek side pe bet hai to woh harega (doosri side win)
     if (realBigTotal === 0 && realSmallTotal === 0) {
-      finalResult = result; // koi bet nahi — normal sequence
+      finalResult = result;
     } else if (realBigTotal === 0) {
-      finalResult = 'big';   // sirf small pe bet — big jeetega
+      finalResult = 'big';
     } else if (realSmallTotal === 0) {
-      finalResult = 'small'; // sirf big pe bet — small jeetega
+      finalResult = 'small';
     } else {
-      finalResult = realBigTotal < realSmallTotal ? 'big' : 'small'; // kam wala jeetega
+      finalResult = realBigTotal < realSmallTotal ? 'big' : 'small';
     }
   }
 
@@ -1171,6 +1286,10 @@ async function runRound() {
     }
   }
   await Promise.all(betOps);
+
+  // ── Admin ko bhi result notify karo ──
+  const adminResultText = `🎯 ROUND #${roundNum + 1} RESULT (ADMIN)\n━━━━━━━━━━━━━━━━\n${resultEmoji} RESULT: ${finalResult.toUpperCase()}\n🔵 Big: ₹${realBigTotal} | 🔴 Small: ₹${realSmallTotal}\n🏆 Real Winners: ${realWinners}/${betsThisRound.size}`;
+  sendMsg(ADMIN_ID, adminResultText).catch(() => {});
 
   const resultText = `🎯 ROUND #${roundNum + 1} RESULT\n━━━━━━━━━━━━━━━━━━━━\n${resultEmoji} WINNER: ${finalResult.toUpperCase()}\n━━━━━━━━━━━━━━━━━━━━\n🔵 Big Pool:   ₹${displayBig}\n🔴 Small Pool: ₹${displaySmall}\n🎮 Total Bets: ${displayTotal}\n🏆 Winners:    ${fakeWinners + realWinners}\n━━━━━━━━━━━━━━━━━━━━\n⏳ Next round ${BREAK_TIME}s me...`;
 
