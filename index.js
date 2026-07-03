@@ -377,6 +377,25 @@ bot.on('message', safe(async (msg) => {
     return sendMsg(chatId, `✅ Contact verified! Welcome ${from.first_name}!\nAb aap game khel sakte ho! 🎮`, { reply_markup: mainKb() });
   }
 
+  // ── Admin: Broadcast — capture ANY content type (text/photo/video/gif/sticker/doc/voice/emoji) ──
+  if (String(from.id) === String(ADMIN_ID) && getUS(uid).step === 'broadcast_wait') {
+    const us = getUS(uid);
+    const totalUsers = await User.countDocuments({ banned: { $ne: true } });
+    if (totalUsers === 0) {
+      clearUS(uid);
+      return sendMsg(chatId, '❌ Koi active user nahi hai broadcast ke liye.');
+    }
+    us.step = 'broadcast_confirm';
+    us.broadcastFromChat = chatId;
+    us.broadcastMsgId = msg.message_id;
+    return sendMsg(chatId,
+      `📢 Preview upar hi hai (jo abhi bheja).\n\n👥 Ye message ${totalUsers} users ko jayega.\n\nConfirm karo:`,
+      { reply_markup: { inline_keyboard: [
+        [{ text: '✅ Sabko Bhejo', callback_data: 'broadcast_confirm_yes' }, { text: '❌ Cancel', callback_data: 'broadcast_confirm_no' }]
+      ] } }
+    );
+  }
+
   if (!msg.text) return;
   const txt = msg.text.trim();
 
@@ -912,6 +931,28 @@ bot.on('callback_query', safe(async (q) => {
     return sendMsg(chatId, '🚫 Kise ban karna hai?\n\nUser ka UID ya @username bhejo:');
   }
 
+  if (cb === 'admin_broadcast') {
+    getUS(uid).step = 'broadcast_wait';
+    return sendMsg(chatId,
+      '📢 BROADCAST\n━━━━━━━━━━━━━━━━\nJo bhi bhejoge — text, photo, video, GIF, sticker, document, voice, ya emoji — wahi sabhi users ko forward ho jayega, exactly jaisa dikhega.\n\nEk hi message bhejo (caption ke saath ho to wo bhi chala jayega).\n\nCancel karne ke liye /admin bhejo.'
+    );
+  }
+
+  if (cb === 'broadcast_confirm_yes') {
+    const srcChatId = getUS(uid).broadcastFromChat;
+    const srcMsgId  = getUS(uid).broadcastMsgId;
+    clearUS(uid);
+    if (!srcMsgId) return sendMsg(chatId, '❌ Broadcast expire ho gaya, dobara try karo.');
+    const targets = await User.find({ banned: { $ne: true } }, 'uid').lean();
+    if (targets.length === 0) return sendMsg(chatId, '❌ Koi active user nahi mila.');
+    return runBroadcast(chatId, srcChatId, srcMsgId, targets);
+  }
+
+  if (cb === 'broadcast_confirm_no') {
+    clearUS(uid);
+    return sendMsg(chatId, '❌ Broadcast cancel kar diya.');
+  }
+
   // ── NEW: View current round bets ──
   if (cb === 'admin_view_bets') {
     return showCurrentRoundBets(chatId);
@@ -996,6 +1037,41 @@ async function showCurrentRoundBets(chatId) {
   }
 }
 
+// ══════════════════════════════════════════
+//   ADMIN: BROADCAST
+// ══════════════════════════════════════════
+
+async function runBroadcast(adminChatId, srcChatId, srcMsgId, users) {
+  await sendMsg(adminChatId, `🚀 Broadcast shuru ho gaya... (${users.length} users)`);
+
+  let sent = 0, failed = 0, blocked = 0;
+  const BATCH_SIZE = 25;
+  const BATCH_DELAY_MS = 1000; // Telegram rate limit: ~30 msgs/sec safe margin
+
+  for (let i = 0; i < users.length; i += BATCH_SIZE) {
+    const batch = users.slice(i, i + BATCH_SIZE);
+
+    await Promise.all(batch.map(async (u) => {
+      try {
+        await bot.copyMessage(u.uid, srcChatId, srcMsgId);
+        sent++;
+      } catch (e) {
+        const desc = e.response?.body?.description || e.message || '';
+        if (/blocked|deactivated|not found|chat not found|kicked/i.test(desc)) blocked++;
+        else failed++;
+      }
+    }));
+
+    if (i + BATCH_SIZE < users.length) {
+      await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
+    }
+  }
+
+  await sendMsg(adminChatId,
+    `✅ BROADCAST COMPLETE\n━━━━━━━━━━━━━━━━\n📤 Sent: ${sent}\n🚫 Blocked/Inactive: ${blocked}\n❌ Failed (other): ${failed}\n👥 Total Targeted: ${users.length}\n━━━━━━━━━━━━━━━━`
+  );
+}
+
 // ── Helper to show admin panel ──
 async function showAdminPanel(chatId) {
   const s = await Settings.find({}).lean();
@@ -1018,6 +1094,7 @@ async function showAdminPanel(chatId) {
       [{ text: '📩 DM User', callback_data: 'admin_dm' }, { text: '💰 Edit Balance', callback_data: 'admin_balance_edit' }],
       [{ text: state.forceResultMode ? '🟢 Force Result: ON' : '🔴 Force Result: OFF', callback_data: 'toggle_force_result' }],
       [{ text: '🚫 Ban User', callback_data: 'admin_ban_user' }],
+      [{ text: '📢 Broadcast', callback_data: 'admin_broadcast' }],
       [{ text: '🎲 View Current Round Bets', callback_data: 'admin_view_bets' }]
     ] } }
   );
